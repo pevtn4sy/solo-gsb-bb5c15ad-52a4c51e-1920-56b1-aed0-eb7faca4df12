@@ -1,5 +1,10 @@
 """API 层测试：正常请求与非法参数（4xx）。"""
+from io import BytesIO
+
+import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfReader
+from reportlab.lib.units import mm
 
 from app.main import app
 
@@ -991,4 +996,132 @@ def test_press_layout_missing_field():
     body = dict(PRESS_LAYOUT_BASE)
     del body["gutter_mm"]
     response = client.post("/api/v1/impose/press-layout", json=body)
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 双面拼版校样 PDF /api/v1/impose/proof.pdf
+# ---------------------------------------------------------------------------
+
+PROOF_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210.0,
+    "page_height_mm": 297.0,
+    "gutter_mm": 10.0,
+    "duplex_flip": "long",
+}
+
+
+def _proof_reader(body) -> tuple:
+    response = client.post("/api/v1/impose/proof.pdf", json=body)
+    assert response.status_code == 200
+    return response, PdfReader(BytesIO(response.content))
+
+
+def test_proof_returns_downloadable_pdf():
+    response, reader = _proof_reader(PROOF_BASE)
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"] == 'attachment; filename="proof.pdf"'
+    assert response.content.startswith(b"%PDF-")
+    # 1 张印张 -> 正面、背面两页
+    assert len(reader.pages) == 2
+
+
+def test_proof_mediabox_matches_press_layout_paper():
+    _, reader = _proof_reader(PROOF_BASE)
+    for page in reader.pages:
+        assert float(page.mediabox.width) == pytest.approx(430.0 * mm, rel=1e-6)
+        assert float(page.mediabox.height) == pytest.approx(297.0 * mm, rel=1e-6)
+
+
+def test_proof_pages_are_front_then_back_with_labels():
+    _, reader = _proof_reader({**PROOF_BASE, "total_pages": 6,
+                               "max_sheets_per_signature": 1})
+    assert len(reader.pages) == 4  # 2 张 × 正反面
+    assert "正面" in reader.pages[0].extract_text()
+    assert "背面" in reader.pages[1].extract_text()
+    # 末帖补白：第 2 帖正面左槽为“空白”
+    assert "空白" in reader.pages[2].extract_text()
+    assert "第2帖" in reader.pages[2].extract_text()
+
+
+def test_proof_short_flip_back_rotated_180():
+    body = {**PROOF_BASE, "duplex_flip": "short", "gutter_mm": 0}
+    _, reader = _proof_reader(body)
+    front = reader.pages[0].get_contents().get_data().decode("latin-1")
+    back = reader.pages[1].get_contents().get_data().decode("latin-1")
+    assert "-1 0 0 -1" not in front
+    assert "-1 0 0 -1" in back
+
+
+def test_proof_right_binding_page_order():
+    _, reader = _proof_reader({**PROOF_BASE, "binding": "right"})
+    front = [line for line in reader.pages[0].extract_text().splitlines()
+             if line.isdigit()]
+    assert front == ["1", "4"]
+
+
+def test_proof_100_sheet_limit_boundary():
+    # 每张 4 页：400 页 = 100 张，允许；401 页 = 101 张，422
+    response = client.post("/api/v1/impose/proof.pdf", json={
+        **PROOF_BASE, "total_pages": 400, "max_sheets_per_signature": 200,
+        "page_width_mm": 50.0, "page_height_mm": 80.0,
+    })
+    assert response.status_code == 200
+    assert len(PdfReader(BytesIO(response.content)).pages) == 200
+
+    response = client.post("/api/v1/impose/proof.pdf", json={
+        **PROOF_BASE, "total_pages": 401, "max_sheets_per_signature": 200,
+        "page_width_mm": 50.0, "page_height_mm": 80.0,
+    })
+    assert response.status_code == 422
+    assert "100" in response.json()["detail"][0]["msg"]
+
+
+def test_proof_invalid_dimensions_return_422():
+    for field, value in (
+        ("page_width_mm", 0),
+        ("page_height_mm", -2),
+        ("gutter_mm", -1),
+    ):
+        response = client.post("/api/v1/impose/proof.pdf",
+                               json={**PROOF_BASE, field: value})
+        assert response.status_code == 422
+
+
+def test_proof_invalid_flip_and_binding_return_422():
+    response = client.post("/api/v1/impose/proof.pdf",
+                           json={**PROOF_BASE, "duplex_flip": "side"})
+    assert response.status_code == 422
+    response = client.post("/api/v1/impose/proof.pdf",
+                           json={**PROOF_BASE, "binding": "top"})
+    assert response.status_code == 422
+
+
+def test_proof_non_finite_dimensions_return_422():
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": NaN, "page_height_mm": 297, "gutter_mm": 0, '
+        '"duplex_flip": "long"}'
+    )
+    response = client.post(
+        "/api/v1/impose/proof.pdf",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_proof_unknown_field_rejected():
+    response = client.post("/api/v1/impose/proof.pdf",
+                           json={**PROOF_BASE, "extra": 1})
+    assert response.status_code == 422
+
+
+def test_proof_missing_field():
+    body = dict(PROOF_BASE)
+    del body["duplex_flip"]
+    response = client.post("/api/v1/impose/proof.pdf", json=body)
     assert response.status_code == 422

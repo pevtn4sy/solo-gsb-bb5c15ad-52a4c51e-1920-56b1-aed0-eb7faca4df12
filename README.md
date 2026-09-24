@@ -17,6 +17,10 @@
 还提供**机台版面**接口 `/api/v1/impose/press-layout`：在上述拼版页序之上给出每张纸的纸面尺寸，
 以及正反面每个页位的页码、左上角坐标与旋转角度（支持双面打印的长边 / 短边翻转），空白页位保留 `null`。
 
+还提供**双面拼版校样**接口 `/api/v1/impose/proof.pdf`：参数与机台版面完全一致，直接返回可下载的
+`proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
+空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -58,6 +62,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 - 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
+- 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 
 ## 接口说明
 
@@ -239,6 +244,78 @@ curl -X POST http://localhost:8000/api/v1/impose/press-layout \
 未定义字段等）外，`page_width_mm` / `page_height_mm` 非正数（含 `0`、负数、`NaN`、
 `Infinity`）、`gutter_mm` 为负数或非有限值、`duplex_flip` 不是 `long`/`short` 时，
 均返回 `422 Unprocessable Entity`。
+
+## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
+
+在机台版面的计算结果上直接绘制可下载的**双面拼版校样 PDF**，用于上机前核对页序、帖号、张号与
+落版方向。本地访问地址 `http://localhost:8000/api/v1/impose/proof.pdf`
+（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/proof.pdf`，`Content-Type: application/json`，**请求参数与
+`/api/v1/impose/press-layout` 完全相同**：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1，且总印张数 ≤ 100 | 总页数（正整数） |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_width_mm` | 数值 | 正数（有限值） | 单页宽度（mm） |
+| `page_height_mm` | 数值 | 正数（有限值） | 单页高度（mm） |
+| `gutter_mm` | 数值 | 非负数（有限值） | 中缝宽度（mm），允许为 `0` |
+| `duplex_flip` | 字符串 | `long` / `short` | 双面翻转：`long`=长边翻转，`short`=短边翻转 |
+
+### 下载示例
+
+用 `curl -o`（或 `--output`）把响应保存为本地文件；响应头
+`Content-Type: application/pdf`、`Content-Disposition: attachment; filename="proof.pdf"`：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/proof.pdf \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 16,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 10,
+    "duplex_flip": "long"
+  }' \
+  -o proof.pdf
+```
+
+启动服务后（`docker compose up -d --build`），在浏览器打开
+<http://localhost:8000/docs>，找到 **“双面拼版校样：下载 proof.pdf”**，
+点击 **Try it out** 填入参数后 **Execute**，也可直接下载 `proof.pdf`；
+健康检查地址为 <http://localhost:8000/health>。
+
+### PDF 内容
+
+- **页数**：每张印张依次生成两页，顺序为**正面（front）→ 背面（back）**，按帖号升序、
+  帖内张号从外到内排列；N 张印张即 2N 页。
+- **纸面尺寸**：每页 MediaBox 与机台版面计算结果一致——
+  宽 `2 × page_width_mm + gutter_mm`、高 `page_height_mm`（单位 mm）。
+- **页位标注**：每个页位居中标注**页码**大字，下方标注“第 N 帖 · 第 M 张 · 正面/背面”；
+  末帖补白等空白页位标注灰色的**“空白”**，同样带帖号、张号。
+- **中缝分隔线**：沿中缝中心（`page_width_mm + gutter_mm / 2`）画一条竖向虚线；
+  `gutter_mm = 0` 时即左右槽分界线。
+- **与机台版面一致**：页序、槽位坐标与旋转角完全沿用 `/api/v1/impose/press-layout`：
+  - press-layout 以**左上角为原点**的毫米坐标换算为 PDF 的**左下角**坐标
+    （`y_pdf = paper_height_mm − y_mm`，再乘 mm→pt）；
+  - 左装订 / 右装订的左右镜像页序一致；
+  - `long`（长边翻转）背面左右槽交换、页位不旋转；
+  - `short`（短边翻转）背面保持槽位，各页位绕自身中心旋转 **180°**（校样中页码、
+    文字一并倒置，与实际短边翻转落版朝向相同）。
+
+### 非法参数与张数上限（4xx）
+
+- 参数校验与 `/api/v1/impose/press-layout` 完全一致：尺寸非正数 / 非有限值、`gutter_mm`
+  为负、`binding` / `duplex_flip` 取值非法、未定义字段等均返回 `422`。
+- **单次最多生成 100 张印张**（即最多 400 页，PDF 最多 200 页）；总页数对应印张数
+  超过 100 张时返回 `422 Unprocessable Entity`，并在错误信息中给出本次张数与页数。
+  400 页（恰好 100 张）仍可正常下载。
 
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 
@@ -569,7 +646,9 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面）
+│   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
+│   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验
 ├── tests/              # 算法与 API 测试（pytest）
 ├── Dockerfile

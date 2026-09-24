@@ -6,7 +6,7 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from .imposition import (
@@ -16,6 +16,12 @@ from .imposition import (
     plan_reprint,
     press_layout,
     UNREAD,
+)
+from .proof import (
+    PROOF_MAX_SHEETS,
+    render_proof_pdf,
+    total_sheet_count,
+    validate_sheet_limit,
 )
 
 app = FastAPI(
@@ -29,8 +35,9 @@ app = FastAPI(
         "支持印张抽检：把乱序实物印张（可原样/左右镜像/正反互换/两者组合解释）"
         "与预期拼版配对并核对已知页位。"
         "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
+        "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -156,6 +163,23 @@ class PressLayoutResponse(BaseModel):
     paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
     signature_count: int
     signatures: list[PressLayoutSignature]
+
+
+# ---------------------------------------------------------------------------
+# 双面拼版校样 PDF /api/v1/impose/proof.pdf
+# ---------------------------------------------------------------------------
+
+
+class ProofRequest(PressLayoutRequest):
+    """校样 PDF 请求：参数与机台版面完全一致，复用同一套校验。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_sheet_count(self) -> "ProofRequest":
+        # 印张总数由总页数决定（每张 4 页，含末帖补白），与每帖张数无关
+        validate_sheet_limit(self.total_pages)
+        return self
 
 
 class ChapterImpositionRequest(BaseModel):
@@ -441,6 +465,34 @@ def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
         duplex_flip=request.duplex_flip,
     )
     return PressLayoutResponse(**layout)
+
+
+@app.post(
+    "/api/v1/impose/proof.pdf",
+    response_class=Response,
+    tags=["拼版"],
+    summary="双面拼版校样：下载 proof.pdf",
+    responses={
+        200: {"content": {"application/pdf": {}}, "description": "可下载的双面拼版校样 PDF"},
+        422: {"description": "参数非法或印张数超过 100 张"},
+    },
+)
+def create_proof_pdf(request: ProofRequest) -> Response:
+    layout = press_layout(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+    )
+    pdf_bytes = render_proof_pdf(layout)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="proof.pdf"'},
+    )
 
 
 @app.post(
