@@ -17,6 +17,10 @@
 还提供**机台版面**接口 `/api/v1/impose/press-layout`：在上述拼版页序之上给出每张纸的纸面尺寸，
 以及正反面每个页位的页码、左上角坐标与旋转角度（支持双面打印的长边 / 短边翻转），空白页位保留 `null`。
 
+还提供**双面拼版校样 PDF** 接口 `/api/v1/impose/proof.pdf`：按机台版面结果逐张生成正面、背面两页的
+可下载 PDF 校样，纸面尺寸与机台版面一致，各页位标注页码、帖号和张号，空白位标注“空白”，
+中缝画出分隔线。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -58,6 +62,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 - 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
+- 双面拼版校样 PDF 接口：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 
 ## 接口说明
 
@@ -239,6 +244,54 @@ curl -X POST http://localhost:8000/api/v1/impose/press-layout \
 未定义字段等）外，`page_width_mm` / `page_height_mm` 非正数（含 `0`、负数、`NaN`、
 `Infinity`）、`gutter_mm` 为负数或非有限值、`duplex_flip` 不是 `long`/`short` 时，
 均返回 `422 Unprocessable Entity`。
+
+## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
+
+在 `/api/v1/impose/press-layout` 的**相同页序、坐标与旋转角**之上，生成可下载的双面拼版
+校样 PDF：每张印张依次生成**正面、背面**两页，用于上机前核对页序、朝向与中缝。
+本地访问地址 `http://localhost:8000/api/v1/impose/proof.pdf`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/proof.pdf`，`Content-Type: application/json`
+
+请求字段与 `/api/v1/impose/press-layout` **完全相同**（`total_pages`、
+`max_sheets_per_signature`、`binding`、`page_width_mm`、`page_height_mm`、
+`gutter_mm`、`duplex_flip`），校验规则也相同。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/proof.pdf \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 16,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 10,
+    "duplex_flip": "long"
+  }' \
+  -o proof.pdf
+```
+
+响应为 `application/pdf`，并带 `Content-Disposition: attachment; filename="proof.pdf"`，
+浏览器访问或用上面的 `curl -o proof.pdf` 即可下载。
+
+### 校样内容
+
+- **纸面尺寸**：PDF 每页大小 = 机台版面纸面尺寸（`2 × 页宽 + 中缝` × `页高`，mm 换算为 pt）。
+- **页序**：按帖号、张号顺序，每张印张先正面后背面，共 `2 × 印张数` 页。
+- **页位标注**：每个页位居中标注页码（`第 N 页`）与 `帖 S · 张 T · 正面/背面`；
+  空白页位标注 `空白`（同样带帖/张/面信息）。
+- **中缝**：以竖直虚线画出分隔线（中缝大于 0 时画两侧边界，为 0 时画一条）。
+- **坐标与旋转**：沿用机台版面的页位坐标与旋转角，把左上原点、y 轴向下的毫米坐标
+  换算为 PDF 的左下原点坐标；`short`（短边翻转）背面页位绕页位中心旋转 180°，
+  与机台版面一致。
+
+### 数量限制与非法参数（4xx）
+
+单次最多生成 **100 张印张**（即 200 页 PDF）；拼版结果超过 100 张时返回
+`422 Unprocessable Entity`。其余参数校验与 `/api/v1/impose/press-layout` 相同。
 
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 
@@ -570,6 +623,7 @@ pytest -q
 ├── app/
 │   ├── __init__.py
 │   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版）
+│   ├── proof.py        # 双面拼版校样 PDF 生成（reportlab）
 │   └── main.py         # FastAPI 路由与参数校验
 ├── tests/              # 算法与 API 测试（pytest）
 ├── Dockerfile

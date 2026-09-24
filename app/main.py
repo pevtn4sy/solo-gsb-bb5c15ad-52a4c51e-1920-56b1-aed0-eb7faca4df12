@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from typing import Literal, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
@@ -17,6 +17,7 @@ from .imposition import (
     press_layout,
     UNREAD,
 )
+from .proof import MAX_PROOF_SHEETS, build_proof_pdf, count_sheets
 
 app = FastAPI(
     title="离线小册子拼版 API",
@@ -29,8 +30,10 @@ app = FastAPI(
         "支持印张抽检：把乱序实物印张（可原样/左右镜像/正反互换/两者组合解释）"
         "与预期拼版配对并核对已知页位。"
         "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
+        "支持双面拼版校样 PDF：按机台版面逐张输出正面、背面两页，"
+        "标注页码、帖号、张号与中缝分隔线。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -441,6 +444,52 @@ def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
         duplex_flip=request.duplex_flip,
     )
     return PressLayoutResponse(**layout)
+
+
+@app.post(
+    "/api/v1/impose/proof.pdf",
+    tags=["拼版"],
+    summary="双面拼版校样 PDF（每张印张依次正面、背面两页）",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"application/pdf": {}},
+            "description": "双面拼版校样 PDF 文件，按附件下载（proof.pdf）",
+        }
+    },
+)
+def create_proof_pdf(request: PressLayoutRequest) -> Response:
+    layout = press_layout(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+    )
+    sheet_total = count_sheets(layout)
+    if sheet_total > MAX_PROOF_SHEETS:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "too_many_sheets",
+                    "loc": ["body"],
+                    "msg": (
+                        f"拼版共 {sheet_total} 张印张，超过单次校样上限 "
+                        f"{MAX_PROOF_SHEETS} 张；请减少 total_pages "
+                        f"或增大 max_sheets_per_signature"
+                    ),
+                    "input": request.total_pages,
+                }
+            ]
+        )
+    pdf_bytes = build_proof_pdf(layout)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="proof.pdf"'},
+    )
 
 
 @app.post(
